@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         飞书文档字体助手
 // @namespace    https://github.com/feishu-font-tool
-// @version      1.0.0
-// @description  调整网页版飞书文档的字体与字号：整篇缩放保留标题层级，也可只改选中文字。仅改变本机显示。
+// @version      1.1.0
+// @description  调整网页版飞书文档的字体与字号：整篇缩放保留标题层级，也可只改选中文字；Aa 按钮可拖动。仅改变本机显示。
 // @author       feishu-font-tool
 // @license      MIT
 // @match        https://*.feishu.cn/*
@@ -159,7 +159,10 @@
       color: var(--fft-fg);
       box-shadow: 0 8px 28px rgba(31, 35, 41, 0.18), 0 1px 2px rgba(31, 35, 41, 0.1);
       backdrop-filter: blur(14px) saturate(1.1);
-      cursor: pointer;
+      cursor: grab;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
       pointer-events: auto;
       transition: transform 0.15s ease, box-shadow 0.15s ease;
     }
@@ -168,6 +171,12 @@
       box-shadow: 0 12px 32px rgba(31, 35, 41, 0.24), 0 2px 6px rgba(31, 35, 41, 0.12);
     }
     .fft-fab:active { transform: translateY(0); }
+    .fft-fab.fft-dragging {
+      cursor: grabbing;
+      transition: none;
+      transform: none !important;
+      box-shadow: 0 14px 36px rgba(31, 35, 41, 0.28), 0 2px 8px rgba(31, 35, 41, 0.14);
+    }
     .fft-fab:focus-visible {
       outline: 3px solid color-mix(in srgb, var(--fft-primary) 35%, transparent);
       outline-offset: 2px;
@@ -486,7 +495,10 @@
     applied: saved.applied && (saved.applied.font || saved.applied.size)
       ? { font: saved.applied.font || '', size: Number(saved.applied.size) || 0 }
       : null,
-    autoApply: saved.autoApply !== false
+    autoApply: saved.autoApply !== false,
+    fabPos: saved.fabPos && Number.isFinite(Number(saved.fabPos.x)) && Number.isFinite(Number(saved.fabPos.y))
+      ? { x: Number(saved.fabPos.x), y: Number(saved.fabPos.y) }
+      : null
   };
 
   function persist() {
@@ -496,7 +508,8 @@
       sizeId: state.ui.sizeId,
       customSize: state.ui.customSize,
       applied: state.applied,
-      autoApply: state.autoApply
+      autoApply: state.autoApply,
+      fabPos: state.fabPos
     }));
   }
 
@@ -885,6 +898,146 @@
     status: null
   };
 
+  const FAB_SIZE = 48;
+  let dragState = null;
+  let suppressClickUntil = 0;
+
+  function defaultFabPos() {
+    const margin = window.innerWidth <= 540 ? 14 : 22;
+    const maxX = Math.max(8, window.innerWidth - FAB_SIZE - 8);
+    const maxY = Math.max(8, window.innerHeight - FAB_SIZE - 8);
+    return {
+      x: clamp(window.innerWidth - margin - FAB_SIZE, 8, maxX),
+      y: clamp(window.innerHeight - margin - FAB_SIZE, 8, maxY)
+    };
+  }
+
+  function getFabPos() {
+    if (!state.fabPos) return defaultFabPos();
+    const maxX = Math.max(8, window.innerWidth - FAB_SIZE - 8);
+    const maxY = Math.max(8, window.innerHeight - FAB_SIZE - 8);
+    return {
+      x: clamp(Number(state.fabPos.x) || 0, 8, maxX),
+      y: clamp(Number(state.fabPos.y) || 0, 8, maxY)
+    };
+  }
+
+  function placeFab() {
+    if (!fab) return;
+    const pos = getFabPos();
+    fab.style.left = pos.x + 'px';
+    fab.style.top = pos.y + 'px';
+    fab.style.right = 'auto';
+    fab.style.bottom = 'auto';
+  }
+
+  function positionPanel() {
+    if (!panel || panel.hidden) return;
+    const pos = getFabPos();
+    const margin = 12;
+    const gap = 10;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    panel.style.maxHeight = Math.max(120, vh - margin * 2) + 'px';
+    const width = panel.offsetWidth || 336;
+    const height = Math.min(panel.offsetHeight || 420, vh - margin * 2);
+
+    let left = pos.x + FAB_SIZE - width;
+    if (pos.x < margin) left = pos.x;
+    left = clamp(left, margin, Math.max(margin, vw - width - margin));
+
+    let top = pos.y - height - gap;
+    if (top < margin) top = pos.y + FAB_SIZE + gap;
+    top = clamp(top, margin, Math.max(margin, vh - height - margin));
+
+    panel.style.left = left + 'px';
+    panel.style.top = top + 'px';
+    panel.style.right = 'auto';
+    panel.style.bottom = 'auto';
+  }
+
+  function setFabPos(x, y) {
+    const maxX = Math.max(8, window.innerWidth - FAB_SIZE - 8);
+    const maxY = Math.max(8, window.innerHeight - FAB_SIZE - 8);
+    state.fabPos = {
+      x: clamp(Math.round(x), 8, maxX),
+      y: clamp(Math.round(y), 8, maxY)
+    };
+    placeFab();
+  }
+
+  function resetFabPosition() {
+    state.fabPos = null;
+    persist();
+    placeFab();
+    if (panel && !panel.hidden) positionPanel();
+    notify('Aa 按钮已回到右下角。', 'ok', false);
+  }
+
+  function finishDrag() {
+    if (!dragState) return;
+    const moved = dragState.moved;
+    const pointerId = dragState.pointerId;
+    dragState = null;
+    if (fab) {
+      fab.classList.remove('fft-dragging');
+      try { fab.releasePointerCapture(pointerId); } catch (err) { /* ignore */ }
+    }
+    if (moved) {
+      suppressClickUntil = performance.now() + 450;
+      persist();
+    }
+  }
+
+  function bindFabDrag() {
+    if (!fab) return;
+
+    fab.addEventListener('pointerdown', function (event) {
+      if (event.button !== 0 || event.isPrimary === false) return;
+      const rect = fab.getBoundingClientRect();
+      dragState = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        origX: rect.left,
+        origY: rect.top,
+        moved: false
+      };
+      event.stopPropagation();
+      try { fab.setPointerCapture(event.pointerId); } catch (err) { /* synthetic events */ }
+    });
+
+    fab.addEventListener('pointermove', function (event) {
+      if (!dragState || event.pointerId !== dragState.pointerId) return;
+      const dx = event.clientX - dragState.startX;
+      const dy = event.clientY - dragState.startY;
+      if (!dragState.moved && Math.sqrt(dx * dx + dy * dy) < 4) return;
+      if (!dragState.moved) {
+        dragState.moved = true;
+        fab.classList.add('fft-dragging');
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      setFabPos(dragState.origX + dx, dragState.origY + dy);
+    });
+
+    fab.addEventListener('pointerup', function (event) {
+      if (!dragState || event.pointerId !== dragState.pointerId) return;
+      event.stopPropagation();
+      finishDrag();
+    });
+
+    fab.addEventListener('pointercancel', function (event) {
+      if (!dragState || event.pointerId !== dragState.pointerId) return;
+      finishDrag();
+    });
+
+    fab.addEventListener('lostpointercapture', function () {
+      finishDrag();
+    });
+  }
+
   function buildOptions() {
     const fontGroups = [
       { label: '跟随 / 通用', ids: ['', 'system'] },
@@ -941,7 +1094,7 @@
     const root = document.createElement('div');
     root.className = 'fft-root';
     root.innerHTML = [
-      '<button class="fft-fab" id="fft-fab" type="button" title="飞书字体助手" aria-label="打开飞书字体助手" aria-expanded="false">',
+      '<button class="fft-fab" id="fft-fab" type="button" title="飞书字体助手（拖动可移动）" aria-label="打开飞书字体助手，可拖动移动位置" aria-expanded="false">',
       '  <span class="fft-a">A</span><span class="fft-a-small">a</span>',
       '</button>',
       '<section class="fft-panel" id="fft-panel" role="dialog" aria-label="飞书字体设置" hidden>',
@@ -970,6 +1123,7 @@
       '  <div class="fft-status" id="fft-status" data-tone="">选择字体或字号后应用；整篇调字号会按正文基准缩放并保留标题层级。</div>',
       '  <div class="fft-foot">',
       '    <label class="fft-check"><input type="checkbox" id="fft-auto"> 新文档自动应用</label>',
+      '    <button class="fft-link" id="fft-reset-pos" type="button">复位位置</button>',
       '    <button class="fft-link" id="fft-clear-sel" type="button">清除选区样式</button>',
       '    <button class="fft-link fft-danger" id="fft-reset" type="button">全部重置</button>',
       '  </div>',
@@ -999,6 +1153,7 @@
     buildOptions();
     restoreUI();
     bindUI();
+    placeFab();
     refreshSelectionButton();
     return true;
   }
@@ -1060,7 +1215,8 @@
 
   function notify(text, tone, toastToo) {
     setStatus(text, tone);
-    if (!toast) return;
+    if (panel && !panel.hidden) window.requestAnimationFrame(positionPanel);
+    if (!panel || !toast) return;
     if (toastToo || panel.hidden) {
       window.clearTimeout(toastTimer);
       toast.textContent = text;
@@ -1076,9 +1232,11 @@
     if (!makeUI()) return;
     panel.hidden = false;
     fab.hidden = true;
+    positionPanel();
     fab.setAttribute('aria-expanded', 'true');
     updateHints();
     refreshSelectionButton();
+    window.requestAnimationFrame(positionPanel);
   }
 
   function closePanel() {
@@ -1086,6 +1244,7 @@
     panel.hidden = true;
     fab.hidden = !isDocPage();
     fab.setAttribute('aria-expanded', 'false');
+    placeFab();
   }
 
   function togglePanel() {
@@ -1102,8 +1261,13 @@
     });
     fab.addEventListener('click', function (event) {
       event.stopPropagation();
+      if (performance.now() < suppressClickUntil) {
+        suppressClickUntil = 0;
+        return;
+      }
       openPanel();
     });
+    bindFabDrag();
 
     const closeBtn = shadow.getElementById('fft-close');
     closeBtn.addEventListener('mousedown', function (event) {
@@ -1213,6 +1377,11 @@
       clearSelectionMarks(false);
     });
 
+    shadow.getElementById('fft-reset-pos').addEventListener('click', function (event) {
+      event.stopPropagation();
+      resetFabPosition();
+    });
+
     ui.reset.addEventListener('click', function (event) {
       event.stopPropagation();
       state.ui = { fontId: '', customFont: '', sizeId: '', customSize: '' };
@@ -1232,7 +1401,11 @@
     document.addEventListener('keyup', onSelectionChange, true);
 
     window.addEventListener('resize', function () {
-      if (!panel.hidden) updateHints();
+      placeFab();
+      if (!panel.hidden) {
+        updateHints();
+        positionPanel();
+      }
     }, { passive: true });
   }
 
@@ -1345,6 +1518,7 @@
     if (typeof GM_registerMenuCommand === 'function') {
       try {
         GM_registerMenuCommand('打开飞书字体面板', togglePanel);
+        GM_registerMenuCommand('复位 Aa 按钮位置', resetFabPosition);
       } catch (err) { /* ignore */ }
     }
 
